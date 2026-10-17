@@ -1,0 +1,151 @@
+
+name: Build Android APK From ZIP
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**/*.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and Publish APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Find and Extract ZIP
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE=""
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            BEFORE="${{ github.event.before }}"
+
+            if [[ "$BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+              ZIP_FILE=$(git diff --name-only "$BEFORE" "$GITHUB_SHA" \
+                | grep -Ei '\.zip$' | head -n 1 || true)
+            fi
+          fi
+
+          if [ -z "$ZIP_FILE" ]; then
+            ZIP_FILE=$(find . -type f -iname '*.zip' \
+              -not -path './.git/*' | sort | head -n 1 || true)
+          fi
+
+          if [ -z "$ZIP_FILE" ] || [ ! -f "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP file found."
+            exit 1
+          fi
+
+          echo "Using ZIP: $ZIP_FILE"
+
+          mkdir -p "$RUNNER_TEMP/android-source"
+          unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/android-source"
+
+          GRADLEW=$(find "$RUNNER_TEMP/android-source" \
+            -type f -name gradlew -print -quit)
+
+          if [ -z "$GRADLEW" ]; then
+            echo "ERROR: Android Gradle wrapper not found."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$GRADLEW")
+
+          if [ ! -f "$PROJECT_DIR/settings.gradle" ] && \
+             [ ! -f "$PROJECT_DIR/settings.gradle.kts" ]; then
+            echo "ERROR: Gradle settings not found."
+            exit 1
+          fi
+
+          if [ ! -f "$PROJECT_DIR/gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "ERROR: Gradle wrapper JAR not found."
+            exit 1
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Build Debug APK
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.extract.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+          chmod +x gradlew
+
+          ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Find APK
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.extract.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+
+          APK=$(find "$PROJECT_DIR" -type f \
+            -path '*/build/outputs/apk/*' \
+            -name '*.apk' | sort | head -n 1 || true)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK not found."
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/output"
+
+          cp "$APK" "$GITHUB_WORKSPACE/output/app-debug.apk"
+
+          echo "APK created successfully."
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: output/app-debug.apk
+          retention-days: 30
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="android-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          gh release create "$TAG" \
+            "output/app-debug.apk" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Android Build $GITHUB_RUN_NUMBER" \
+            --notes "Automatic Android APK build from ZIP." \
+            --latest
+
+          echo "## APK Download" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/app-debug.apk" >> "$GITHUB_STEP_SUMMARY"
